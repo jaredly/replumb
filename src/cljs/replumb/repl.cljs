@@ -115,14 +115,16 @@
   ([]
    (make-base-eval-opts! {}))
   ([opts]
-   {:ns (:current-ns @app-env)
-    :context :expr
-    :source-map false
-    :def-emits-var true
-    :load (:load-fn! opts)
-    :eval cljs/js-eval
-    :verbose (or (:verbose opts) false)
-    :static-fns false}))
+   (merge
+    {:ns (:current-ns @app-env)
+     :source-map false
+     :def-emits-var true
+     :load (:load-fn! opts)
+     :eval cljs/js-eval
+     :verbose (or (:verbose opts) false)
+     :static-fns false}
+    (when-not (:filename opts)
+      {:context :expr}))))
 
 (defn self-require?
   [specs]
@@ -228,7 +230,7 @@
 (def valid-opts-set
   "Set of valid option used for external input validation."
   #{:verbose :warning-as-error :target :init-fn!
-    :load-fn! :read-file-fn! :src-paths})
+    :load-fn! :read-file-fn! :src-paths :filename})
 
 (defn valid-opts
   "Validate the input user options. Returns a new map without invalid
@@ -591,6 +593,24 @@
       (call-back (common/wrap-success (s/join (map #(with-out-str (repl/print-doc %)) ms))))
       (call-back (common/wrap-success "nil")))))
 
+(declare read-eval-call)
+
+(defn process-load-file
+  [{:keys [verbose read-file-fn! src-paths] :as opts} cb data filename]
+  (let [call-back (partial call-back! opts cb data)]
+    (if read-file-fn!
+      (load/read-files-and-callback! verbose
+                                     (load/file-paths src-paths filename)
+                                     read-file-fn!
+                                     (fn [result]
+                                       (if result
+                                         (read-eval-call (assoc opts :filename filename) cb (:source result))
+                                         (call-back (common/wrap-error
+                                                     (ex-info (str "Could not load file " filename) ex-info-data))))))
+      (do (when verbose
+            (common/debug-prn "No :read-file-fn! provided, skipping file loading..."))
+          (call-back (common/wrap-success nil))))))
+
 (defn process-repl-special
   [opts cb data expression-form]
   (let [argument (second expression-form)]
@@ -605,7 +625,7 @@
       dir (process-dir opts cb data argument)
       apropos (process-apropos opts cb data argument)
       find-doc (process-find-doc opts cb data argument)
-      load-file (call-back! opts cb data (common/error-keyword-not-supported "load-file" ex-info-data))))) ;; (process-load-file argument opts)
+      load-file (process-load-file opts cb data argument))))
 
 (defn process-1-2-3
   [data expression-form value]
@@ -744,6 +764,7 @@
   supporting:
 
   * :verbose - will enable the the evaluation logging, defaults to false
+  * :filename - the path to a file to load, if any
   * :warning-as-error - will consider a compiler warning as error
   * :target - :nodejs and :browser supported, the latter is used if
   missing
@@ -788,16 +809,17 @@
           opts (normalize-opts opts) ;; AR - does the whole user option processing
           data {:form expression-form
                 :ns (:current-ns @app-env)
-                :target (keyword *target*)}]
+                :target (keyword *target*)}
+          filename (:filename opts)]
       (init-repl-if-necessary! opts data)
       (when (:verbose opts)
         (common/debug-prn "Calling eval-str on" expression-form "with options" (common/filter-fn-keys opts)))
       (binding [ana/*cljs-warning-handlers* [(partial custom-warning-handler opts cb)]]
-        (if (repl-special? expression-form)
+        (if (and (not filename) (repl-special? expression-form))
           (process-repl-special opts cb data expression-form)
           (cljs/eval-str st
                          source
-                         source
+                         (if filename (str "Evaluating file " filename) source)
                          ;; opts (map)
                          (make-base-eval-opts! opts)
                          (fn [res]
@@ -805,8 +827,9 @@
                              (common/debug-prn "Evaluation returned: " res))
                            (call-back! opts cb
                                        (merge data
-                                              {:on-success-fn! #(do (process-1-2-3 data expression-form (:value res))
-                                                                    (swap! app-env assoc :current-ns (:ns res)))})
+                                              {:on-success-fn! #(when-not filename
+                                                                  (process-1-2-3 data expression-form (:value res))
+                                                                  (swap! app-env assoc :current-ns (:ns res)))})
                                        res))))))
     (catch :default e
       (when (:verbose opts)
